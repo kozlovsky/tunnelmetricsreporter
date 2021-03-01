@@ -62,8 +62,8 @@ class Record:
 
 class MetricsReporter:
     def __init__(self, session, settings: ReporterSettings = None):
-        instance_index = int(os.environ.get("HELPER_INDEX", "0"))
-        self.instance_index = instance_index
+        self.node_name = os.environ.get('ANSIBLE_INVENTORY_HOSTNAME')
+        self.instance_index = int(os.environ.get("HELPER_INDEX", "0"))
         self.session = session
         if self.session.tunnel_community is None:
             raise RuntimeError('Tunnel community was not loaded')
@@ -218,6 +218,7 @@ class MetricsReporter:
         try:
             t = time.time()
             requests.post(self.settings.collector_url, json={
+                'node_name': self.node_name,
                 'instance_index': self.instance_index,
                 'metrics': data,
             })
