@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import threading
 import time
@@ -45,9 +46,12 @@ class Record:
 
 
 class MetricsReporter:
-    def __init__(self, instance_index: int, session, settings: ReporterSettings = None):
+    def __init__(self, session, settings: ReporterSettings = None):
+        instance_index = int(os.environ.get("HELPER_INDEX", "0"))
         self.instance_index = instance_index
         self.session = session
+        if self.session.tunnel_community is None:
+            raise RuntimeError('Tunnel community was not loaded')
         if settings is None:
             settings = ReporterSettings()
         self.settings = settings
@@ -60,6 +64,8 @@ class MetricsReporter:
     def start(self):
         logging.info('Starting MetricsReporter output thread')
         self.output_thread.start()
+        self.session.register_task('report_statistics', self.report_statistics,
+                                   interval=self.settings.reporting_interval)
 
     def shutdown(self):
         if self.exiting.is_set():
@@ -82,7 +88,10 @@ class MetricsReporter:
 
         t = time.time()
         endpoint = self.session.ipv8.endpoint
-        self.queue.put(Record(time.time(), endpoint.bytes_up, endpoint.bytes_down, t - self.session.ipv8_start_time))
+        self.queue.put(Record(t=time.time(),
+                              uploaded_bytes=endpoint.bytes_up,
+                              downloaded_bytes=endpoint.bytes_down,
+                              uptime=t - self.session.ipv8_start_time))
 
     def wait_for_records(self, thread_name) -> Tuple[bool, List[Record]]:
         exiting = False
