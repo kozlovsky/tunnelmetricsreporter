@@ -4,10 +4,13 @@ import queue
 import threading
 import time
 
+from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
 import pydantic
 import requests
+
+from tribler_common.simpledefs import NTFY
 
 
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +24,11 @@ COLLECTOR_URL = 'http://localhost:3322/tunnel/report'
 REPORTING_INTERVAL = 60 * SECOND
 MAX_QUEUE_SIZE = 100000
 
-MAX_COUNTER_VALUE = 2 ** 31
+MAX_COUNTER_VALUE = 2 ** 50
+MAX_SUM_VALUE = 2 ** 50
+
+NTFY_TUNNEL_REMOVE = "tunnel_remove"
+
 
 start_time = time.time()
 
@@ -36,13 +43,21 @@ class ReporterSettings(pydantic.BaseSettings):
         env_prefix = 'tunnelmetricsreporter_'
 
 
+@dataclass
 class Record:
-    __slots__ = ['t', 'uploaded_bytes', 'downloaded_bytes', 'uptime']
-    def __init__(self, t, uploaded_bytes, downloaded_bytes, uptime):
-        self.t = t
-        self.uploaded_bytes = uploaded_bytes
-        self.downloaded_bytes = downloaded_bytes
-        self.uptime = uptime
+    t: float
+    uptime: float
+    uploaded_bytes: int
+    downloaded_bytes: int
+    circuits_num: int
+    rejected_positive_balance_count: int
+    rejected_positive_balance_total: float
+    rejected_negative_balance_count: int
+    rejected_negative_balance_total: float
+    removed_circuits_count: int
+    removed_circuits_duration_total: float
+    removed_circuits_downloaded_total: float
+    removed_circuits_uploaded_total: float
 
 
 class MetricsReporter:
@@ -55,17 +70,30 @@ class MetricsReporter:
         if settings is None:
             settings = ReporterSettings()
         self.settings = settings
-        self.lock = threading.Lock()
         self.queue = queue.Queue()
         self.output_thread = OutputThread(self)
         self.exiting = threading.Event()
         self.finished = False
+        self.previous_reject_callback = None
+        self.lock = threading.Lock()
+        self.removed_circuits_count = 0
+        self.removed_circuits_duration_total = 0
+        self.removed_circuits_downloaded_total = 0
+        self.removed_circuits_uploaded_total = 0
+        self.rejected_negative_balance_count = 0
+        self.rejected_negative_balance_total = 0
+        self.rejected_positive_balance_count = 0
+        self.rejected_positive_balance_total = 0
 
     def start(self):
         logging.info('Starting MetricsReporter output thread')
         self.output_thread.start()
         self.session.register_task('report_statistics', self.report_statistics,
                                    interval=self.settings.reporting_interval)
+        self.session.notifier.add_observer(NTFY.TUNNEL_REMOVE, self.circuit_removed)
+        tunnel_community = self.session.tunnel_community
+        self.previous_reject_callback = tunnel_community.reject_callback
+        tunnel_community.reject_callback = self.on_circuit_reject
 
     def shutdown(self):
         if self.exiting.is_set():
@@ -77,6 +105,44 @@ class MetricsReporter:
         logging.info('MetricsReporter shutdown complete')
         self.finished = True
 
+    def circuit_removed(self, circuit, additional_info):
+        duration = time.time() - circuit.creation_time
+        # circuit.circuit_id, circuit.bytes_up, circuit.bytes_down
+        with self.lock:
+            self.removed_circuits_count += 1
+            self.removed_circuits_duration_total += duration
+            self.removed_circuits_downloaded_total += circuit.bytes_down
+            self.removed_circuits_uploaded_total += circuit.bytes_up
+            if (
+                self.removed_circuits_count > MAX_COUNTER_VALUE or
+                self.removed_circuits_duration_total > MAX_SUM_VALUE or
+                self.removed_circuits_downloaded_total > MAX_SUM_VALUE or
+                self.removed_circuits_uploaded_total > MAX_SUM_VALUE
+            ):
+                self.removed_circuits_count = 0
+                self.removed_circuits_duration_total = 0
+                self.removed_circuits_downloaded_total = 0
+                self.removed_circuits_uploaded_total = 0
+
+    def on_circuit_reject(self, reject_time, balance):
+        balance = float(balance)
+        with self.lock:
+            if balance > 0:
+                self.rejected_positive_balance_count += 1
+                self.rejected_positive_balance_total += balance
+                if self.rejected_positive_balance_total > MAX_SUM_VALUE:
+                    self.rejected_positive_balance_count = 0
+                    self.rejected_positive_balance_total = 0
+            else:
+                self.rejected_negative_balance_count += 1
+                self.rejected_negative_balance_total += (-balance)  # should we check for overflow?
+                if self.rejected_negative_balance_total > MAX_SUM_VALUE:
+                    self.rejected_negative_balance_count = 0
+                    self.rejected_negative_balance_total = 0
+
+        if self.previous_reject_callback:
+            self.previous_reject_callback(reject_time, balance)
+
     def report_statistics(self):
         if self.exiting.is_set():
             return
@@ -86,12 +152,23 @@ class MetricsReporter:
             logging.error('MetricsReporter: Max queue size exceeded')
             return
 
-        t = time.time()
-        endpoint = self.session.ipv8.endpoint
-        self.queue.put(Record(t=time.time(),
-                              uploaded_bytes=endpoint.bytes_up,
-                              downloaded_bytes=endpoint.bytes_down,
-                              uptime=t - self.session.ipv8_start_time))
+        with self.lock:
+            t = time.time()
+            self.queue.put(Record(
+                t=time.time(),
+                uptime=t - self.session.ipv8_start_time,
+                uploaded_bytes=self.session.ipv8.endpoint.bytes_up,
+                downloaded_bytes=self.session.ipv8.endpoint.bytes_down,
+                circuits_num=len(self.session.tunnel_community.circuits),
+                removed_circuits_count=self.removed_circuits_count,
+                rejected_positive_balance_count = self.rejected_positive_balance_count,
+                rejected_positive_balance_total = self.rejected_positive_balance_total,
+                rejected_negative_balance_count = self.rejected_negative_balance_count,
+                rejected_negative_balance_total = self.rejected_negative_balance_total,
+                removed_circuits_duration_total = self.removed_circuits_duration_total,
+                removed_circuits_downloaded_total = self.removed_circuits_downloaded_total,
+                removed_circuits_uploaded_total = self.removed_circuits_uploaded_total,
+            ))
 
     def wait_for_records(self, thread_name) -> Tuple[bool, List[Record]]:
         exiting = False
@@ -119,10 +196,21 @@ class MetricsReporter:
         # Called from OutputThread
         data = []
         for record in records:
-            data.append(dict(t=record.t,
-                             uploaded_bytes=record.uploaded_bytes,
-                             downloaded_bytes=record.downloaded_bytes,
-                             uptime=record.uptime))
+            data.append(dict(
+                t=record.t,
+                uptime=record.uptime,
+                uploaded_bytes=record.uploaded_bytes,
+                downloaded_bytes=record.downloaded_bytes,
+                circuits_num=record.circuits_num,
+                removed_circuits_count=record.removed_circuits_count,
+                rejected_positive_balance_count=record.rejected_positive_balance_count,
+                rejected_positive_balance_total=record.rejected_positive_balance_total,
+                rejected_negative_balance_count=record.rejected_negative_balance_count,
+                rejected_negative_balance_total=record.rejected_negative_balance_total,
+                removed_circuits_duration_total=record.removed_circuits_duration_total,
+                removed_circuits_downloaded_total=record.removed_circuits_downloaded_total,
+                removed_circuits_uploaded_total=record.removed_circuits_uploaded_total,
+            ))
         return data
 
     def send_data(self, data: List[Dict]):
